@@ -1,67 +1,105 @@
 import pandas as pd
-import os
+import boto3
+import uuid
+from botocore.exceptions import NoCredentialsError
 
-# === Extract Phase ===
+# Extract Phase
 def extract_data(file_path):
-    print("Extracting raw migration data from local file...")
-
-    if not os.path.exists(file_path):
-        print(f" File not found at: {file_path}")
-        return pd.DataFrame()
-    
     try:
         df = pd.read_csv(file_path)
         print("Data extracted successfully.")
         return df
     except Exception as e:
-        print("Failed to read the CSV file:", e)
-        return pd.DataFrame()
+        print(f"Error extracting data: {e}")
+        return None
 
-# === Transform Phase ===
+# Transformation Phase
 def transform_data(df):
-    print(" Transforming data...")
+    try:
+        df.columns = df.columns.str.strip()
 
-    if df.empty:
-        print(" No data to transform.")
-        return df
+        # Keep only relevant columns
+        columns_to_keep = ['Country Dest Name'] + [col for col in df.columns if col.startswith('19') or col.startswith('20')]
+        df = df[columns_to_keep]
 
-    print(" Original columns:", df.columns.tolist())
+        # Convert wide format to long format
+        df_melted = df.melt(id_vars=['Country Dest Name'], var_name='Year', value_name='MigrationCount')
 
-    # Droping rows with missing values
-    df_clean = df.dropna()
+        # Rename columns to match DynamoDB schema
+        df_melted.rename(columns={'Country Dest Name': 'State'}, inplace=True)
 
-    # Example transformations 
-    df_clean = df_clean.rename(columns={
-        'State of Origin': 'Origin_State',
-        'State of Destination': 'Destination_State',
-        'Year': 'Migration_Year'
-    }) if 'State of Origin' in df.columns else df_clean
+        # Remove rows with missing data
+        df_melted.dropna(subset=['Year', 'State', 'MigrationCount'], inplace=True)
 
-    if 'Migration_Year' in df_clean.columns:
-        df_clean['Migration_Year'] = df_clean['Migration_Year'].astype(int)
-        df_clean = df_clean[df_clean['Migration_Year'] >= 2000]  
+        # Remove invalid or placeholder values
+        df_melted = df_melted[~df_melted['MigrationCount'].astype(str).isin(['', ' ', '..', 'NaN', 'nan'])]
 
-    # Remove duplicates
-    df_clean = df_clean.drop_duplicates()
+        # Clean up and ensure string format
+        df_melted['Year'] = df_melted['Year'].astype(str).str.extract(r'(\d{4})')[0]
+        df_melted['State'] = df_melted['State'].astype(str).str.strip()
+        df_melted['MigrationCount'] = df_melted['MigrationCount'].astype(str).str.strip()
 
-    print(" Data transformation complete.")
-    return df_clean
+        # Final drop of any rows with now-empty fields
+        df_melted.dropna(subset=['Year', 'State', 'MigrationCount'], inplace=True)
 
-# === Load Phase ===
-def load_data(df_clean, output_path="cleaned_indian_migration.csv"):
-    if df_clean.empty:
-        print(" No data to save.")
-        return
-    print(f" Saving cleaned data to {output_path}...")
-    df_clean.to_csv(output_path, index=False)
-    print("✅ Data saved successfully.")
+        print("Data transformed successfully.")
+        return df_melted
+    except Exception as e:
+        print(f"Error transforming data: {e}")
+        return None
 
-# === Main Execution ===
-def main():
-    file_path = r"C:\Users\Hp\OneDrive\Desktop\archive (3)\IndianMigrationHistory1.3.csv"
-    raw_df = extract_data(file_path)
-    cleaned_df = transform_data(raw_df)
-    load_data(cleaned_df)
+# Loading Phase: Upload to S3
+def upload_to_s3(file_name, bucket, object_key):
+    s3 = boto3.client('s3')
+    try:
+        s3.upload_file(file_name, bucket, object_key)
+        print(f"File uploaded to S3: s3://{bucket}/{object_key}")
+    except FileNotFoundError:
+        print("File not found.")
+    except NoCredentialsError:
+        print("AWS credentials not available.")
+    except Exception as e:
+        print(f"Failed to upload file to S3: {e}")
 
+# Loading Phase: Insert into DynamoDB
+def insert_into_dynamodb(table_name, df):
+    try:
+        dynamodb = boto3.resource('dynamodb')
+        table = dynamodb.Table(table_name)
+
+        skipped = 0
+        for _, row in df.iterrows():
+            item = {
+                'RecordID': str(uuid.uuid4()),
+                'Year': str(row.get('Year', '')).strip(),
+                'State': str(row.get('State', '')).strip(),
+                'MigrationCount': str(row.get('MigrationCount', '')).strip()
+            }
+
+            if item['Year'] and item['State'] and item['MigrationCount']:
+                table.put_item(Item=item)
+            else:
+                skipped += 1
+                print(f"Skipping row due to missing field(s): {item}")
+
+        print(f"Data inserted into DynamoDB. Skipped {skipped} invalid rows.")
+    except Exception as e:
+        print(f"Error inserting into DynamoDB: {e}")
+
+# Main Execution
 if __name__ == "__main__":
-    main()
+    file_path = "IndianMigrationHistory1.3.csv"
+    df = extract_data(file_path)
+
+    if df is not None:
+        df_cleaned = transform_data(df)
+        if df_cleaned is not None:
+            cleaned_file = "cleaned_indian_migration.csv"
+            df_cleaned.to_csv(cleaned_file, index=False)
+
+            bucket_name = "indian-migration-data-bucket"
+            s3_key = "cleaned_data/cleaned_indian_migration.csv"
+            upload_to_s3(cleaned_file, bucket_name, s3_key)
+
+            dynamodb_table = "MigrationRecords"
+            insert_into_dynamodb(dynamodb_table, df_cleaned)
