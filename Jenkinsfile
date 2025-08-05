@@ -7,12 +7,12 @@
             AWS_DEFAULT_REGION    = 'us-east-1'
         }
 
-        stages {
-            stage('Clone GitHub Repository') {
-                steps {
-                    git 'https://github.com/Nikx-Ai/ETL-Project.git'
-                }
-            }
+        stage('Clone GitHub Repository') {
+    steps {
+        git branch: 'main', url: 'https://github.com/Nikx-Ai/ETL-Project.git'
+    }
+}
+
 
             stage('Install Python Dependencies') {
                 steps {
