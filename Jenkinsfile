@@ -1,26 +1,25 @@
 pipeline {
-    agent {
-        docker {
-            image 'python:3.10-slim'
-            args '-u root'  // if permission issues
-        }
-    }
+    agent any
+
     environment {
-        AWS_ACCESS_KEY_ID = credentials('your-aws-key-id')
-        AWS_SECRET_ACCESS_KEY = credentials('your-aws-secret-key')
+        AWS_ACCESS_KEY_ID = credentials('your-aws-access-key-id')
+        AWS_SECRET_ACCESS_KEY = credentials('your-aws-secret-access-key')
     }
+
     stages {
         stage('Install Python Dependencies') {
             steps {
-                sh 'pip install boto3 pandas'
+                sh 'pip3 install --user boto3 pandas'
             }
         }
+
         stage('Run ETL Pipeline') {
             steps {
-                sh 'python ETL.py'
+                sh 'python3 ETL.py'
             }
         }
     }
+
     post {
         failure {
             echo '❌ ETL job failed. Check logs.'
@@ -30,4 +29,3 @@ pipeline {
         }
     }
 }
-
