@@ -1,3 +1,9 @@
+docker-setup
 pandas
 boto3
 awscli
+=======
+pandas
+boto3
+awscli
+ main
