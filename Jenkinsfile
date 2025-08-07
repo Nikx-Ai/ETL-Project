@@ -1,44 +1,42 @@
 pipeline {
-  agent any
+    agent any
 
-  environment {
-    IMAGE = 'leo0011/etlproject1:latest'
-  }
-
-  stages {
-    stage('Clone GitHub Repo') {
-      steps {
-        git url: 'https://github.com/Nikx-Ai/ETL-Project.git', branch: 'main'
-      }
+    environment {
+        AWS_ACCESS_KEY_ID = credentials('aws-access-key-id')
+        AWS_SECRET_ACCESS_KEY = credentials('aws-secret-access-key')
+        AWS_DEFAULT_REGION = 'us-east-1'
     }
 
-    stage('Build Docker Image') {
-      steps {
-        sh 'docker build -t $IMAGE .'
-      }
-    }
-
-    stage('Run ETL Job in Container') {
-      steps {
-        sh 'docker run --rm $IMAGE'
-      }
-    }
-
-    stage('Push Image to DockerHub') {
-      steps {
-        withDockerRegistry([credentialsId: 'dockerhub-creds', url: '']) {
-          sh 'docker push $IMAGE'
+    stages {
+        stage('Clone Repository') {
+            steps {
+                git branch: 'jenkins-setup',
+                    url: 'https://github.com/Nikx-Ai/ETL-Project.git'
+            }
         }
-      }
-    }
-  }
 
-  post {
-    success {
-      echo '✅ ETL pipeline completed and image pushed successfully!'
+        stage('Install Python Dependencies') {
+            steps {
+                sh 'pip3 install boto3 pandas'
+            }
+        }
+
+        stage('Run ETL Pipeline') {
+            steps {
+                sh '''
+                export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+                export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+                export AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION
+                python3 ETL.py
+                '''
+            }
+        }
     }
-    failure {
-      echo '❌ Pipeline failed. Check console logs.'
+
+    post {
+        always {
+            echo '✅ ETL job completed successfully!'
+        }
     }
-  }
 }
+
