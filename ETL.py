@@ -1,6 +1,7 @@
 import pandas as pd
 import boto3
 import uuid
+import datetime
 from botocore.exceptions import NoCredentialsError
 
 
@@ -21,7 +22,6 @@ def transform_data(df):
         # Clean column names
         df.columns = df.columns.str.strip().str.lower()
 
-
         expected_columns = ['firstname', 'lastname', 'bloodgroup']
 
         # Keep only relevant columns that exist
@@ -29,26 +29,22 @@ def transform_data(df):
         df = df[available_columns]
 
         # Clean the data
-        # Remove leading/trailing whitespace
         for col in df.columns:
             if df[col].dtype == 'object':
                 df[col] = df[col].astype(str).str.strip()
 
-        # Replace empty strings and 'nan' with None
-        df = df.replace(['', 'nan', 'NaN', 'null'], None)
+        # Replace null values with "0"
+        df = df.replace(['', 'nan', 'NaN', 'null'], '0')
+        df = df.fillna('0')  # Replace any remaining null values with "0"
 
-        # Create a unique identifier for each record
         df['RecordID'] = [str(uuid.uuid4()) for _ in range(len(df))]
 
-        # Remove completely empty rows (where all main fields are None/empty)
-        df_cleaned = df.dropna(how='all', subset=['firstname', 'lastname', 'bloodgroup'])
+        # Standardize blood group format if present (keep "0" as is)
+        if 'bloodgroup' in df.columns:
+            df['bloodgroup'] = df['bloodgroup'].apply(lambda x: x.upper() if x != '0' else '0')
 
-        # Standardize blood group format if present
-        if 'bloodgroup' in df_cleaned.columns:
-            df_cleaned['bloodgroup'] = df_cleaned['bloodgroup'].str.upper()
-
-        print(f" Data transformed successfully. {len(df_cleaned)} records processed.")
-        return df_cleaned
+        print(f" Data transformed successfully. {len(df)} records processed.")
+        return df
     except Exception as e:
         print(f" Error transforming data: {e}")
         return None
@@ -58,8 +54,28 @@ def transform_data(df):
 def upload_to_s3(file_name, bucket, object_key):
     s3 = boto3.client('s3')
     try:
+        # First, delete all existing files in the cleaned_data/ prefix
+        try:
+            response = s3.list_objects_v2(Bucket=bucket, Prefix='cleaned_data/')
+            if 'Contents' in response:
+                objects_to_delete = [{'Key': obj['Key']} for obj in response['Contents']]
+                if objects_to_delete:
+                    s3.delete_objects(
+                        Bucket=bucket,
+                        Delete={'Objects': objects_to_delete}
+                    )
+                    print(f" Deleted {len(objects_to_delete)} old files from S3")
+                else:
+                    print(" No old files found in S3")
+            else:
+                print("✓ No old files found in S3")
+        except Exception as delete_error:
+            print(f" Warning: Could not delete old S3 files: {delete_error}")
+
+        # Upload new file to S3
         s3.upload_file(file_name, bucket, object_key)
         print(f" File uploaded to S3: s3://{bucket}/{object_key}")
+
     except FileNotFoundError:
         print(" File not found.")
     except NoCredentialsError:
@@ -74,32 +90,52 @@ def insert_into_dynamodb(table_name, df):
         dynamodb = boto3.resource('dynamodb')
         table = dynamodb.Table(table_name)
 
+        # First, delete all existing records in the table
+        try:
+            print(" Deleting old records from DynamoDB...")
+            scan_response = table.scan()
+
+            # Delete existing records in batches
+            with table.batch_writer() as batch:
+                for item in scan_response['Items']:
+                    batch.delete_item(Key={'RecordID': item['RecordID']})
+
+            # Handle pagination if there are more records
+            while 'LastEvaluatedKey' in scan_response:
+                scan_response = table.scan(ExclusiveStartKey=scan_response['LastEvaluatedKey'])
+                with table.batch_writer() as batch:
+                    for item in scan_response['Items']:
+                        batch.delete_item(Key={'RecordID': item['RecordID']})
+
+            print("✓ Old records deleted from DynamoDB")
+
+        except Exception as delete_error:
+            print(f"⚠ Warning: Could not delete old DynamoDB records: {delete_error}")
+
         successful_inserts = 0
         skipped = 0
 
+        # Insert new records
+        print(" Inserting new records...")
         for _, row in df.iterrows():
             item = {
                 'RecordID': str(row.get('RecordID', str(uuid.uuid4()))),
-                'FirstName': str(row.get('firstname', '')).strip() if pd.notna(row.get('firstname')) else '',
-                'LastName': str(row.get('lastname', '')).strip() if pd.notna(row.get('lastname')) else '',
-                'BloodGroup': str(row.get('bloodgroup', '')).strip() if pd.notna(row.get('bloodgroup')) else ''
+                'FirstName': str(row.get('firstname', '0')),
+                'LastName': str(row.get('lastname', '0')),
+                'BloodGroup': str(row.get('bloodgroup', '0'))
             }
 
-            # Only insert if we have at least one non-empty field besides RecordID
-            if any([item['FirstName'], item['LastName'], item['BloodGroup']]):
-                try:
-                    table.put_item(Item=item)
-                    successful_inserts += 1
-                except Exception as e:
-                    print(f" Error inserting record {item['RecordID']}: {e}")
-                    skipped += 1
-            else:
+            try:
+                table.put_item(Item=item)
+                successful_inserts += 1
+            except Exception as e:
+                print(f"✗ Error inserting record {item['RecordID']}: {e}")
                 skipped += 1
-                print(f" Skipping row due to all empty fields: {item['RecordID']}")
 
-        print(f" Data inserted into DynamoDB. {successful_inserts} successful inserts, {skipped} skipped rows.")
+        print(f"✓ Data inserted into DynamoDB. {successful_inserts} successful inserts, {skipped} failed.")
+
     except Exception as e:
-        print(f"Error inserting into DynamoDB: {e}")
+        print(f"✗ Error inserting into DynamoDB: {e}")
 
 
 # Data validation function
@@ -110,36 +146,34 @@ def validate_data(df):
 
     for col in df.columns:
         if col != 'RecordID':
-            non_null_count = df[col].notna().sum()
-            print(f"{col}: {non_null_count} non-null values")
+            total_count = len(df[col])
+            zero_count = (df[col] == '0').sum()
+            non_zero_count = total_count - zero_count
+            print(f"{col}: {non_zero_count} non-zero values, {zero_count} zero values")
 
     # Show unique blood groups if available
     if 'bloodgroup' in df.columns:
-        unique_blood_groups = df['bloodgroup'].dropna().unique()
+        unique_blood_groups = df['bloodgroup'].unique()
         print(f"Unique blood groups: {unique_blood_groups}")
 
 
 # Main Execution
 if __name__ == "__main__":
-    file_path = "random dataset - Sheet1 (1).csv"
+    file_path = "random dataset - Sheet1.csv"
     df = extract_data(file_path)
 
     if df is not None:
         df_cleaned = transform_data(df)
         if df_cleaned is not None:
-            # Validate and show data summary
             validate_data(df_cleaned)
 
-            # Save cleaned data
             cleaned_file = "cleaned_personal_data.csv"
             df_cleaned.to_csv(cleaned_file, index=False)
-            print(f" Cleaned data saved to {cleaned_file}")
+            print(f"✓ Cleaned data saved to {cleaned_file}")
 
-            # Upload to S3
             bucket_name = "indian-migration-data-bucket"
             s3_key = "cleaned_data/cleaned_personal_data.csv"
             upload_to_s3(cleaned_file, bucket_name, s3_key)
 
-            # Insert into DynamoDB
             dynamodb_table = "MigrationRecords"
             insert_into_dynamodb(dynamodb_table, df_cleaned)
