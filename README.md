@@ -124,5 +124,3 @@ Docker + Jenkins (CI/CD automation)
 Mentor: **P Y Shreekanth (Founder & IT Instructor, StepAhead)**
 
 ---
-
-Would you like me to also create a **shorter recruiter-friendly version** (with more emphasis on your skills and less on technical details) that you can use on your GitHub profile/project showcase?
